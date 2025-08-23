@@ -1,0 +1,5 @@
+name: ExfilCraft
+version: '1.0-SNAPSHOT'
+main: org.kami.exfilCraft.ExfilCraft
+api-version: '1.21'
+load: STARTUP

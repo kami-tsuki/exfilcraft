@@ -1,0 +1,22 @@
+# ExfilCraft Configuration
+# Phase 0 / Phase 1 foundational settings
+
+debug: true
+currencyName: "Credits"
+maxConcurrentRaidSessions: 10
+
+bunker:
+  worldName: "exfil_bunkers"
+  expansionCubeSize: 16
+  maxCubes: 512 # 8x8x8 cubes
+  expansionCostBaseXp: 100 # cost = base * currentCubeCount (for next cube)
+  expansionCooldownMinutes: 10
+  inviteExpiryMinutes: 60
+  startY: 64
+  height: 16
+  minChunkSeparation: 64 # chunks distance (Manhattan or Chebyshev) between bunker origins
+
+database:
+  file: "plugins/ExfilCraft/data.db"
+
+

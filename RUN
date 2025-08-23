@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Automated build + hot redeploy + restart script for ExfilCraft
+# Usage: ./RUN [--no-build] [--no-start] [--follow]
+# Requires: bash, Java 21, Maven
+
+set -euo pipefail
+shopt -s nullglob
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SERVER_JAR="paper.jar"           # Adjust if different
+PLUGIN_NAME="ExfilCraft"         # Base name
+MEM_MIN="1G"
+MEM_MAX="2G"
+JAVA_ARGS=("-Xms${MEM_MIN}" "-Xmx${MEM_MAX}")
+SERVER_ARGS=("--nogui")
+LOG_DIR="${PROJECT_DIR}/logs"
+PID_FILE="${PROJECT_DIR}/server.pid"
+FOLLOW=0
+DO_BUILD=1
+DO_START=1
+
+log(){ printf '[RUN] %s\n' "$*"; }
+err(){ printf '[RUN][ERROR] %s\n' "$*" >&2; }
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-build) DO_BUILD=0 ; shift ;;
+    --no-start) DO_START=0 ; shift ;;
+    --follow) FOLLOW=1 ; shift ;;
+  esac
+done
+
+require() { command -v "$1" >/dev/null 2>&1 || { err "Missing required command: $1"; exit 1; }; }
+
+require java
+if (( DO_BUILD )); then require mvn; fi
+
+cd "$PROJECT_DIR"
+
+if [[ ! -f $SERVER_JAR ]]; then
+  err "Server jar '$SERVER_JAR' not found in $PROJECT_DIR. Download Paper (paper-<ver>-<build>.jar) and symlink or rename to $SERVER_JAR."
+  exit 1
+fi
+
+build_plugin(){
+  if (( ! DO_BUILD )); then
+    log "Skipping build (--no-build)"
+    return
+  fi
+  log "Cleaning & packaging plugin"
+  mvn -q clean package || { err "Maven build failed"; exit 1; }
+}
+
+stop_server(){
+  local pids
+  pids=$(pgrep -f "$SERVER_JAR" || true)
+  if [[ -z "$pids" ]]; then
+    log "Server not running"
+    return
+  fi
+  log "Stopping server (PIDs: $pids)"
+  # Try graceful TERM first
+  kill -TERM $pids || true
+  local waited=0
+  while kill -0 $pids 2>/dev/null; do
+    sleep 1
+    waited=$((waited+1))
+    if (( waited >= 30 )); then
+      err "Server still running after 30s, sending KILL"
+      kill -KILL $pids || true
+      break
+    fi
+  done
+  log "Server stopped"
+  rm -f "$PID_FILE"
+}
+
+deploy_plugin(){
+  mkdir -p plugins
+  log "Removing old plugin jars"
+  rm -f plugins/${PLUGIN_NAME}-*.jar || true
+  local built
+  # Prefer shaded jar if present
+  if built=$(ls -1 target/${PLUGIN_NAME}-*-shaded.jar 2>/dev/null | head -n1); then :; else
+    built=$(ls -1 target/${PLUGIN_NAME}-*.jar 2>/dev/null | grep -v 'original-' | head -n1 || true)
+  fi
+  if [[ -z "$built" || ! -f "$built" ]]; then
+    err "Built plugin jar not found in target/"
+    exit 1
+  fi
+  log "Deploying $(basename "$built") -> plugins/"
+  cp "$built" plugins/
+}
+
+start_server(){
+  if (( ! DO_START )); then
+    log "Skipping server start (--no-start)"
+    return
+  fi
+  if pgrep -f "$SERVER_JAR" >/dev/null 2>&1; then
+    err "Server already running; not starting another instance"
+    exit 1
+  fi
+  mkdir -p "$LOG_DIR"
+  local log_file="$LOG_DIR/latest-run.log"
+  log "Starting server (logging to $log_file)"
+  nohup java "${JAVA_ARGS[@]}" -jar "$SERVER_JAR" "${SERVER_ARGS[@]}" >"$log_file" 2>&1 &
+  local pid=$!
+  echo $pid > "$PID_FILE"
+  log "Server PID $pid"
+  # Quick readiness probe: wait until log contains 'Done (' or process dies
+  for i in {1..60}; do
+    if ! kill -0 $pid 2>/dev/null; then
+      err "Server process exited prematurely"
+      tail -n 50 "$log_file" >&2 || true
+      exit 1
+    fi
+    if grep -q 'Done (' "$log_file" 2>/dev/null; then
+      log "Server started (world loaded)"
+      break
+    fi
+    sleep 1
+  done
+  if (( FOLLOW )); then
+    log "Following log (Ctrl+C to detach)"
+    tail -n 50 -f "$log_file"
+  fi
+}
+
+main(){
+  build_plugin
+  stop_server
+  deploy_plugin
+  start_server
+  log "Cycle complete"
+}
+
+main "$@"
+
