@@ -1,5 +1,31 @@
 name: ExfilCraft
 version: '1.0-SNAPSHOT'
 main: org.kami.exfilCraft.ExfilCraft
+description: Extraction raiding + bunker progression system.
+authors: ["tsuki"]
 api-version: '1.21'
-load: STARTUP
+load: POSTWORLD
+softdepend: [Vault, PlaceholderAPI, WorldEdit, WorldGuard, LuckPerms, Citizens, MythicMobs, CoreProtect]
+commands:
+  exfil:
+    description: Base ExfilCraft command (use /exfil help)
+    usage: /<command> help
+    aliases: [exf]
+  bunker:
+    description: Bunker management (use /bunker help)
+    usage: /<command> help
+    aliases: [bnk]
+  team:
+    description: Temporary raid team management (use /team help)
+    usage: /<command> help
+  raid:
+    description: Raid queue and status (use /raid help)
+    usage: /<command> help
+  admin:
+    description: ExfilCraft administrative/testing commands (use /admin help)
+    usage: /<command> help
+    permission: exfil.admin
+permissions:
+  exfil.admin:
+    description: Allows administrative ExfilCraft commands
+    default: op

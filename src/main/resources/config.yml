@@ -1,22 +1,349 @@
 # ExfilCraft Configuration
-# Phase 0 / Phase 1 foundational settings
+# Documentation: All settings are hot-reloadable via /exfil reload unless noted.
 
+# Global Debug Toggle
 debug: true
+
+# Currency label used in UI
 currencyName: "Credits"
+
+# Legacy (will be superseded by raid.maxConcurrentSessions below)
 maxConcurrentRaidSessions: 10
+
+logging:
+  prefix: "&7[&aExfilCraft&7]"
+  colorize: true
+  debug: true # mirrors top-level debug but can be forced off here
+  spamSuppressionSeconds: 1.5 # identical message to same player suppressed within window
+
+communications:
+  raid:
+    bossBar: true
+    extractingProgressActionBar: false # if false falls back to throttled chat
+    extractionActiveChat: true
+    finalPhaseChat: true
+  bunker:
+    expansionSuccessChat: true
+    expansionFailChat: true
+
+messages:
+  raid:
+    start: "&aRaid started. Extraction unlocks in &f{unlockSeconds}s"
+    extractionActive: "&aExtraction point is now ACTIVE! Follow your compass."
+    finalPhase: "&cFINAL PHASE! &f{remaining} &cleft. Extract or perish."
+    extractingProgress: "&aExtracting... &f{seconds}s"
+    extractSuccess: "&aExtraction successful!"
+    death: "&cYou died in Raid #{id}. Items lost."
+    forfeit: "&cForfeited Raid #{id} (disconnect). Loot dropped."
+    rejoin: "&aRejoined Raid #{id}. Absent {absent}s"
+    timeoutFailure: "&cRaid failed (time)."
+  bunker:
+    expansionSuccess: "&aExtended bunker. Cost {cost} XP. Cubes {cubes}. Cooldown {cooldown}m"
+    expansionFailCost: "&cNeed {cost} XP (you have {have})."
+    expansionCooldown: "&cOn cooldown: {seconds}s"
+    expansionLimit: "&cExpansion limit reached."
+    expansionDuplicate: "&cCube already unlocked."
+
+starterKit:
+  enabled: true
+  overwriteArmor: false
+  items:
+    - slot: helmet
+      type: LEATHER_HELMET
+      name: "&aStarter Helm"
+    - slot: chestplate
+      type: LEATHER_CHESTPLATE
+    - slot: leggings
+      type: LEATHER_LEGGINGS
+    - slot: boots
+      type: LEATHER_BOOTS
+    - type: WOODEN_PICKAXE
+    - type: STONE_SWORD
+    - type: BOW
+    - type: ARROW
+      amount: 16
+    - type: TORCH
+      amount: 16
+      offhand: true
 
 bunker:
   worldName: "exfil_bunkers"
   expansionCubeSize: 16
-  maxCubes: 512 # 8x8x8 cubes
-  expansionCostBaseXp: 100 # cost = base * currentCubeCount (for next cube)
+  maxCubes: 512
+  expansionCostBaseXp: 100
   expansionCooldownMinutes: 10
   inviteExpiryMinutes: 60
   startY: 64
   height: 16
-  minChunkSeparation: 64 # chunks distance (Manhattan or Chebyshev) between bunker origins
+  minChunkSeparation: 64
+  rules:
+    preventDamage: true
+    preventHunger: true
+    disableMobSpawns: true
+    disableDaylightCycle: true
+    disableWeatherCycle: true
+    randomTickSpeed: 0
+    disableGrowth: true
+    disableFluidSource: true
+    disableHoppers: true
+    allowedBonemealGrowth: true
+    initialHorizontalLimit: 9
+    horizontalPlaneOnly: true
 
 database:
   file: "plugins/ExfilCraft/data.db"
 
+raid:
+  minPlayers: 1
+  maxConcurrentSessions: 10
+  worldSizeChunks: 16
+  durationMinutes: 10
+  extraction:
+    channelSeconds: 10
+    radius: 3
+    particle: HAPPY_VILLAGER
+    availabilityPercent: 0.10
+    openAfterSeconds: 60 # overrides availabilityPercent when present
+  queue:
+    autoStart: true
+    countdownSeconds: 10
+  spawn:
+    safeScanMaxTries: 50
+  preload:
+    spawnRadiusChunks: 2
+    extractionRadiusChunks: 1
+  cleanup:
+    deleteWorldOnEnd: true
+    delaySeconds: 5
+  bossBar:
+    title: "&aRaid Time Remaining"
+    color: GREEN
+    style: SOLID
+  templates:
+    # Template configuration documentation:
+    # Each key under raid.templates is a template id. Fields:
+    #  enabled: true/false to include in GUI
+    #  name: Display name shown in selection GUI
+    #  environment: OVERWORLD | NETHER | END (THE_END also accepted)
+    #  sizeChunks: World border square size in chunks (e.g. 16 => 256x256 blocks)
+    #  durationMinutes: Total raid duration.
+    #  extractionOpenAfterSeconds: Time-based unlock; omit or set -1 with unlockCondition DRAGON_DEFEATED for dragon kill unlock.
+    #  unlockCondition: TIME | DRAGON_DEFEATED
+    #  minPlayers/maxPlayers: Aggregate players required / allowed.
+    #  minTeams/maxTeams: Team count bounds (teams are party groupings queued together).
+    #  maxPlayersPerTeam: Hard cap per team.
+    #  extractionRadius: (optional) override global raid.extraction.radius
+    #  channelSeconds: (optional) override raid.extraction.channelSeconds
+    #  spawnProtectionSeconds: (optional) override default spawn protection (movement & damage blocked)
+    #  forceNight: If true locks time to night (Overworld only)
+    #  requireCenterStructure: If true at least one structure must be near 0,0 inside centerRadiusChunks (or centerRequiredStructures list if provided)
+    #  requiredStructures: (list) Structures that must exist anywhere in search radius (names match Bukkit structure types, e.g. VILLAGE, END_CITY)
+    #  centerRequiredStructures: (list) One of these must be near center (if list non-empty). Accepts multiple; success if any present.
+    #  centerRadiusChunks: Radius from 0,0 in chunks to look for center structures.
+    #  requireDragon: If true, ensure an Ender Dragon is spawned immediately (End only) and extraction uses DRAGON_DEFEATED unless overridden.
+    #  alwaysEndCities: Forces END_CITY presence requirement (End only).
+    #  maxWorldGenAttempts: Regeneration attempts if terrain/structure requirements fail.
+    #  Notes: Structure keys are case-insensitive. Use quotes if YAML treats value ambiguously.
 
+    over_small_easy:
+      enabled: true
+      name: "Overworld Small / Easy"
+      environment: OVERWORLD
+      sizeChunks: 16
+      durationMinutes: 10
+      extractionOpenAfterSeconds: 300 # 5 min
+      unlockCondition: TIME
+      minPlayers: 2
+      maxPlayers: 8 # e.g. up to 4 duos or 8 solos
+      minTeams: 2
+      maxTeams: 4
+      maxPlayersPerTeam: 4
+      spawnProtectionSeconds: 5
+      extractionRadius: 3
+      channelSeconds: 10
+      forceNight: false
+      requireCenterStructure: false
+      requiredStructures: [ ]
+      centerRequiredStructures: [ ]
+      centerRadiusChunks: 4
+      requireDragon: false
+      alwaysEndCities: false
+      maxWorldGenAttempts: 6
+      displayItem: GRASS_BLOCK
+      order: 0
+
+    over_medium_struct:
+      enabled: true
+      name: "Overworld Medium / Structures"
+      environment: OVERWORLD
+      sizeChunks: 32
+      durationMinutes: 25
+      extractionOpenAfterSeconds: 1200 # 20 min
+      unlockCondition: TIME
+      minPlayers: 4
+      maxPlayers: 32
+      minTeams: 4
+      maxTeams: 8
+      maxPlayersPerTeam: 8
+      forceNight: true
+      requireCenterStructure: true
+      requiredStructures: [ ]
+      centerRequiredStructures: [ "VILLAGE", "PILLAGER_OUTPOST" ]
+      centerRadiusChunks: 6
+      maxWorldGenAttempts: 6
+      displayItem: COBBLESTONE
+      order: 1
+
+    over_big_hard:
+      enabled: true
+      name: "Overworld Large / Hard"
+      environment: OVERWORLD
+      sizeChunks: 64
+      durationMinutes: 45
+      extractionOpenAfterSeconds: 1500 # 25 min
+      unlockCondition: TIME
+      minPlayers: 8
+      maxPlayers: 64
+      minTeams: 8
+      maxTeams: 16
+      maxPlayersPerTeam: 8
+      forceNight: true
+      requireCenterStructure: true
+      requiredStructures: [ "ANCIENT_CITY", "STRONGHOLD" ]
+      centerRequiredStructures: [ "MANSION", "ANCIENT_CITY" ]
+      centerRadiusChunks: 8
+      maxWorldGenAttempts: 8
+      displayItem: STRUCTURE_BLOCK
+      order: 2
+
+    nether_small_medium:
+      enabled: true
+      name: "Nether Small / Medium"
+      environment: NETHER
+      sizeChunks: 16
+      durationMinutes: 15
+      extractionOpenAfterSeconds: 600 # 10 min
+      unlockCondition: TIME
+      minPlayers: 2
+      maxPlayers: 16
+      minTeams: 2
+      maxTeams: 4
+      maxPlayersPerTeam: 4
+      requireCenterStructure: false
+      requiredStructures: [ ]
+      centerRequiredStructures: [ ]
+      centerRadiusChunks: 4
+      maxWorldGenAttempts: 6
+      displayItem: NETHERRACK
+      order: 3
+
+    nether_medium_hard:
+      enabled: true
+      name: "Nether Medium / Hard"
+      environment: NETHER
+      sizeChunks: 32
+      durationMinutes: 35
+      extractionOpenAfterSeconds: 1500 # 25 min
+      unlockCondition: TIME
+      minPlayers: 4
+      maxPlayers: 32
+      minTeams: 4
+      maxTeams: 8
+      maxPlayersPerTeam: 8
+      requireCenterStructure: true
+      centerRequiredStructures: [ "FORTRESS", "BASTION_REMNANT" ]
+      centerRadiusChunks: 6
+      requiredStructures: [ ]
+      maxWorldGenAttempts: 6
+      displayItem: WITHER_SKELETON_SKULL
+      order: 4
+
+    nether_big_hard_wither: # Coming soon template
+      enabled: false
+      name: "Nether Large / Wither (Coming Soon)"
+      environment: NETHER
+      sizeChunks: 48
+      durationMinutes: 50
+      extractionOpenAfterSeconds: 1800 # 30 min
+      unlockCondition: TIME
+      minPlayers: 6
+      maxPlayers: 48
+      minTeams: 6
+      maxTeams: 12
+      maxPlayersPerTeam: 8
+      requireCenterStructure: true
+      centerRequiredStructures: [ "FORTRESS", "BASTION_REMNANT" ]
+      centerRadiusChunks: 8
+      requiredStructures: [ ]
+      maxWorldGenAttempts: 6
+      displayItem: BEACON
+      order: 5
+
+    end_small_pvp:
+      enabled: true
+      name: "End Small / PvP"
+      environment: END
+      sizeChunks: 16
+      durationMinutes: 20
+      extractionOpenAfterSeconds: 900 # 15 min
+      unlockCondition: TIME
+      minPlayers: 2
+      maxPlayers: 16
+      minTeams: 2
+      maxTeams: 4
+      maxPlayersPerTeam: 4
+      requireDragon: false
+      alwaysEndCities: false
+      requireCenterStructure: false
+      requiredStructures: [ ]
+      centerRequiredStructures: [ ]
+      centerRadiusChunks: 4
+      maxWorldGenAttempts: 6
+      displayItem: END_STONE
+      order: 6
+
+    end_medium_dragon:
+      enabled: true
+      name: "End Medium / Dragon"
+      environment: END
+      sizeChunks: 32
+      durationMinutes: 30
+      extractionOpenAfterSeconds: -1
+      unlockCondition: DRAGON_DEFEATED
+      minPlayers: 2
+      maxPlayers: 16
+      minTeams: 2
+      maxTeams: 4
+      maxPlayersPerTeam: 4
+      requireDragon: true
+      alwaysEndCities: false
+      requireCenterStructure: false
+      requiredStructures: [ ]
+      centerRequiredStructures: [ ]
+      centerRadiusChunks: 4
+      maxWorldGenAttempts: 6
+      displayItem: DRAGON_HEAD
+      order: 7
+
+    end_big_hard:
+      enabled: true
+      name: "End Large / Hard"
+      environment: END
+      sizeChunks: 64
+      durationMinutes: 60
+      extractionOpenAfterSeconds: 1800 # 30 min
+      unlockCondition: TIME
+      minPlayers: 8
+      maxPlayers: 64
+      minTeams: 8
+      maxTeams: 16
+      maxPlayersPerTeam: 8
+      requireDragon: false
+      alwaysEndCities: true
+      requireCenterStructure: false
+      requiredStructures: [ ]
+      centerRequiredStructures: [ ]
+      centerRadiusChunks: 6
+      maxWorldGenAttempts: 8
+      displayItem: PURPUR_BLOCK
+      order: 8

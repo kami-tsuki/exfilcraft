@@ -1,139 +1,495 @@
-#!/usr/bin/env bash
-# Automated build + hot redeploy + restart script for ExfilCraft
-# Usage: ./RUN [--no-build] [--no-start] [--follow]
-# Requires: bash, Java 21, Maven
+#!/bin/bash
 
-set -euo pipefail
-shopt -s nullglob
+# ExfilCraft Simple Runner
+# Clean -> Compile -> Build -> Test -> Deploy -> Start Server
+set -e
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SERVER_JAR="paper.jar"           # Adjust if different
-PLUGIN_NAME="ExfilCraft"         # Base name
-MEM_MIN="1G"
-MEM_MAX="2G"
-JAVA_ARGS=("-Xms${MEM_MIN}" "-Xmx${MEM_MAX}")
-SERVER_ARGS=("--nogui")
-LOG_DIR="${PROJECT_DIR}/logs"
-PID_FILE="${PROJECT_DIR}/server.pid"
-FOLLOW=0
-DO_BUILD=1
-DO_START=1
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-log(){ printf '[RUN] %s\n' "$*"; }
-err(){ printf '[RUN][ERROR] %s\n' "$*" >&2; }
+# Config (allow environment override) - default updated to 1.21.8
+: "${PAPER_VERSION:=1.21.8}"          # Desired Paper / MC version (may fallback to base if patch unsupported)
+: "${PAPER_BUILD:=latest}"            # Specific Paper build number or 'latest'
+: "${MC_CLIENT_VERSION:=$PAPER_VERSION}"  # Exact client version expected
+PROJECT_NAME="ExfilCraft"
+SERVER_DIR=".server"
+PLUGIN_JAR="target/${PROJECT_NAME}-1.0-SNAPSHOT-shaded.jar"
+SERVER_JAR="$SERVER_DIR/paper.jar"
+PAPER_API="https://api.papermc.io/v2/projects/paper"
+PAPER_META="$SERVER_DIR/.paper-meta"
+REQUESTED_PAPER_VERSION="$PAPER_VERSION"  # Preserve user request before fallback
+: "${INTERACTIVE:=1}"   # 1 = foreground interactive console, 0 = non-interactive (background + tail)
 
-for arg in "$@"; do
-  case "$arg" in
-    --no-build) DO_BUILD=0 ; shift ;;
-    --no-start) DO_START=0 ; shift ;;
-    --follow) FOLLOW=1 ; shift ;;
-  esac
+log() {
+    local level=$1
+    shift
+    case $level in
+        "ERROR") echo -e "${RED}[ERROR]${NC} $*" ;;
+        "WARN")  echo -e "${YELLOW}[WARN ]${NC} $*" ;;
+        "INFO")  echo -e "${BLUE}[INFO ]${NC} $*" ;;
+        "OK")    echo -e "${GREEN}[OK   ]${NC} $*" ;;
+    esac
+}
+
+check_java() {
+    if ! command -v java &> /dev/null; then
+        log "ERROR" "Java not found"
+        exit 1
+    fi
+
+    if ! command -v mvn &> /dev/null; then
+        log "ERROR" "Maven not found"
+        exit 1
+    fi
+}
+
+clean_build() {
+    log "INFO" "Cleaning..."
+    mvn clean -q || { log "ERROR" "Clean failed"; exit 1; }
+    log "OK" "Clean complete"
+}
+
+compile_project() {
+    log "INFO" "Compiling..."
+    if mvn compile -q 2>/dev/null; then
+        log "OK" "Compile complete"
+    else
+        log "ERROR" "Compile failed"
+        mvn compile
+        exit 1
+    fi
+}
+
+build_project() {
+    log "INFO" "Building artifact..."
+    if mvn package -DskipTests -q 2>/dev/null; then
+        log "OK" "Build complete"
+    else
+        log "ERROR" "Build failed"
+        mvn package -DskipTests
+        exit 1
+    fi
+}
+
+run_tests() {
+    log "INFO" "Running tests..."
+    if mvn test -q 2>/dev/null; then
+        log "OK" "Tests passed"
+    else
+        log "WARN" "Tests failed - continuing anyway"
+        mvn test | grep -E "(ERROR|WARN|Tests run:|Failures:|Errors:)" || true
+    fi
+}
+
+# List available Paper versions
+list_paper_versions() {
+    local json
+    if command -v curl >/dev/null 2>&1; then
+        json=$(curl -s "${PAPER_API}") || { log ERROR "Failed to query Paper API"; return 1; }
+    else
+        json=$(wget -q -O - "${PAPER_API}") || { log ERROR "Failed to query Paper API"; return 1; }
+    fi
+    echo "$json" | tr ',' '\n' | grep -o '"[0-9]\+\.[0-9]\+\(\.[0-9]\+\)\?"' | tr -d '"' | sort -V | uniq
+}
+
+validate_paper_version() {
+    local version="$1"
+    local versions=$(list_paper_versions)
+    if echo "$versions" | grep -Fxq "$version"; then
+        return 0
+    fi
+    # Attempt fallback: if version has 3 components (major.minor.patch) reduce to major.minor
+    if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        local base="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+        if echo "$versions" | grep -Fxq "$base"; then
+            log WARN "Paper build for requested version '$version' not found; falling back to '$base' while retaining client requirement $version"
+            PAPER_VERSION="$base"  # adjust global
+            return 0
+        fi
+    fi
+    log ERROR "Requested version '$version' is not available."
+    log INFO "Available versions (truncated):"
+    echo "$versions" | tail -n 25 | sed 's/^/  - /'
+    return 1
+}
+
+# Utility: fetch latest build number for version (with validation)
+resolve_paper_build() {
+    local version="$1"
+    validate_paper_version "$version" || return 1
+    local json
+    if command -v curl >/dev/null 2>&1; then
+        json=$(curl -s "${PAPER_API}/versions/${version}/builds") || return 1
+    else
+        json=$(wget -q -O - "${PAPER_API}/versions/${version}/builds") || return 1
+    fi
+    local build
+    build=$(echo "$json" | grep -o '"build":[0-9]\+' | sed 's/[^0-9]//g' | tail -1)
+    if [[ -z "$build" ]]; then
+        log ERROR "Could not resolve latest build for version ${version}"; return 1; fi
+    echo "$build"
+}
+
+write_meta() {
+    local version="$1"; local build="$2"
+    echo "version=${version}" > "$PAPER_META"
+    echo "build=${build}" >> "$PAPER_META"
+}
+
+read_meta() {
+    [[ -f "$PAPER_META" ]] || return 1
+    source "$PAPER_META"
+    [[ -n "$version" && -n "$build" ]] || return 1
+    echo "${version}:${build}"
+}
+
+meta_matches() {
+    local want_version="$1"; local want_build="$2"
+    if [[ ! -f "$PAPER_META" ]]; then return 1; fi
+    source "$PAPER_META"
+    [[ "$version" == "$want_version" && "$build" == "$want_build" ]]
+}
+
+basic_verify_jar() {
+    # Args: file path
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    local size
+    size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    if [[ $size -lt 500000 ]]; then
+        log WARN "Jar $file size ($size bytes) suspiciously small"; return 1; fi
+    if ! jar tf "$file" >/dev/null 2>&1; then
+        log WARN "Jar $file is not a valid archive"; return 1; fi
+    return 0
+}
+
+# Download paper jar (with integrity check)
+download_paper() {
+    mkdir -p "$SERVER_DIR"
+    local version="$PAPER_VERSION"
+    local build="$PAPER_BUILD"
+
+    if [[ "$build" == "latest" ]]; then
+        build=$(resolve_paper_build "$version") || { log ERROR "Failed to get latest Paper build"; exit 1; }
+        log INFO "Resolved latest Paper build: ${version} #${build}"
+    else
+        validate_paper_version "$version" || { log ERROR "Invalid version ${version}"; exit 1; }
+    fi
+
+    # If meta mismatches desired version/build, remove existing jar & meta
+    if ! meta_matches "$version" "$build"; then
+        rm -f "$SERVER_JAR" "$PAPER_META"
+    fi
+
+    if [[ -f "$SERVER_JAR" ]]; then
+        log INFO "Paper jar already present for ${version} build ${build}"
+        # Ensure existing jar at least structurally valid
+        if basic_verify_jar "$SERVER_JAR"; then
+            write_meta "$version" "$build"
+            return 0
+        else
+            log WARN "Existing paper.jar failed basic verification; re-downloading"
+            rm -f "$SERVER_JAR" "$PAPER_META"
+        fi
+    fi
+
+    local filename="paper-${version}-${build}.jar"
+    local url="${PAPER_API}/versions/${version}/builds/${build}/downloads/${filename}"
+
+    log INFO "Downloading Paper ${version} build ${build}..."
+    if command -v curl >/dev/null 2>&1; then
+        if ! curl -L -f -s -o "$SERVER_JAR" "$url"; then log ERROR "Download failed"; rm -f "$SERVER_JAR"; exit 1; fi
+    else
+        if ! wget -q -O "$SERVER_JAR" "$url"; then log ERROR "Download failed"; rm -f "$SERVER_JAR"; exit 1; fi
+    fi
+
+    if basic_verify_jar "$SERVER_JAR"; then
+        write_meta "$version" "$build"
+        log OK "Server downloaded"
+    else
+        log ERROR "Downloaded file failed basic verification"
+        rm -f "$SERVER_JAR"
+        exit 1
+    fi
+}
+
+# Verify jar integrity (simple jar listing + version/build meta)
+verify_paper() {
+    # Ensures current SERVER_JAR matches desired version/build (if meta exists) and is structurally valid
+    local want_version="${PAPER_VERSION}" want_build="${PAPER_BUILD}"
+    if [[ "$want_build" == "latest" ]]; then
+        want_build=$(resolve_paper_build "$want_version") || return 1
+    fi
+    [[ -f "$SERVER_JAR" ]] || return 1
+    if ! basic_verify_jar "$SERVER_JAR"; then return 1; fi
+    # If meta missing, accept and write meta so future checks enforce version
+    if [[ ! -f "$PAPER_META" ]]; then
+        write_meta "$want_version" "$want_build"
+        return 0
+    fi
+    if meta_matches "$want_version" "$want_build"; then
+        return 0
+    else
+        log WARN "paper.jar version/build mismatch with desired (${want_version}#${want_build}); will trigger re-download"
+        return 1
+    fi
+}
+
+setup_server() {
+    mkdir -p "$SERVER_DIR/plugins"
+
+    if verify_paper; then
+        :
+    else
+        log INFO "Ensuring Paper server (version=${PAPER_VERSION} build=${PAPER_BUILD})..."
+        download_paper
+    fi
+
+    echo "eula=true" > "$SERVER_DIR/eula.txt"
+
+    cat > "$SERVER_DIR/server.properties" << 'EOF'
+server-port=25565
+gamemode=survival
+difficulty=normal
+max-players=4
+online-mode=false
+motd=ExfilCraft Dev Server
+view-distance=6
+spawn-protection=0
+enable-command-block=true
+allow-flight=true
+level-name=test_world
+EOF
+}
+
+deploy_plugin() {
+    if [[ ! -f "$PLUGIN_JAR" ]]; then
+        log "ERROR" "Plugin JAR not found: $PLUGIN_JAR"
+        exit 1
+    fi
+
+    log "INFO" "Deploying plugin..."
+
+    # Remove old plugin
+    rm -f "$SERVER_DIR/plugins/${PROJECT_NAME}"*.jar
+
+    # Copy new plugin
+    cp "$PLUGIN_JAR" "$SERVER_DIR/plugins/"
+    log "OK" "Plugin deployed"
+}
+
+stop_existing_server() {
+    if [[ -f "$SERVER_DIR/server.pid" ]]; then
+        local pid=$(cat "$SERVER_DIR/server.pid")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "INFO" "Stopping existing server..."
+            kill "$pid"
+            sleep 3
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$SERVER_DIR/server.pid"
+    fi
+}
+
+cleanup() {
+    # Robust cleanup whether we are inside project root or inside .server
+    local root_pid_file="$SERVER_DIR/server.pid"
+    local local_pid_file="server.pid"
+    local pid_file=""
+    if [[ -f "$root_pid_file" ]]; then
+        pid_file="$root_pid_file"
+    elif [[ -f "$local_pid_file" ]]; then
+        pid_file="$local_pid_file"
+    fi
+    if [[ -n "$pid_file" ]]; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            log INFO "Stopping server (PID: $pid)..."
+            kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pid_file"
+    fi
+}
+
+# Ensure cleanup always runs (also on Ctrl+C / TERM)
+trap cleanup EXIT INT TERM
+
+verify_runtime_version() {
+    # Args: none (runs inside start loop before tail), uses SERVER_DIR/logs/latest.log
+    local log_file="$SERVER_DIR/logs/latest.log"
+    [[ -f "$log_file" ]] || return 1
+    # Extract actual MC version advertised by Paper bootstrap line
+    local actual
+    actual=$(grep -m1 'for Minecraft ' "$log_file" | sed -E 's/.*for Minecraft ([0-9.]+).*/\1/' || true)
+    [[ -n "$actual" ]] || return 2
+    local expected_client="$MC_CLIENT_VERSION"
+    # Accept exact match; optionally allow if expected equals actual or both share same first two components when client more specific and PAPER_VERSION matches
+    if [[ "$actual" == "$expected_client" ]]; then
+        log OK "Runtime MC version $actual matches client requirement"
+        return 0
+    fi
+    # Compare major.minor(.patch) prefix logic
+    local prefix_expected prefix_actual
+    prefix_expected=$(echo "$expected_client" | cut -d. -f1-2)
+    prefix_actual=$(echo "$actual" | cut -d. -f1-2)
+    if [[ "$prefix_expected" == "$prefix_actual" && "$actual" == "$PAPER_VERSION" ]]; then
+        log WARN "Minor/patch mismatch: client=$expected_client server=$actual (base match). Consider setting --mc $expected_client if available."
+        return 0
+    fi
+    log ERROR "Server MC version $actual does not match required client version $expected_client"
+    return 3
+}
+
+start_server() {
+    setup_server
+    deploy_plugin
+    stop_existing_server
+
+    if ! verify_paper; then
+        log ERROR "paper.jar invalid after setup. Aborting."; exit 1
+    fi
+
+    if [[ "$INTERACTIVE" -eq 1 ]]; then
+        log INFO "Starting server INTERACTIVE (MC ${PAPER_VERSION}, build=${PAPER_BUILD}, client=${MC_CLIENT_VERSION})"
+        cd "$SERVER_DIR"
+        echo "(Type server commands here; use 'stop' to shutdown.)" >&2
+        # Direct foreground execution; user gains full console.
+        java -Xmx2G -Xms1G -jar paper.jar nogui
+        return
+    fi
+
+    log INFO "Starting server (non-interactive) (MC ${PAPER_VERSION}, build=${PAPER_BUILD}, client=${MC_CLIENT_VERSION})..."
+    cd "$SERVER_DIR"
+    java -Xmx2G -Xms1G -jar paper.jar nogui &
+    local server_pid=$!
+    echo "$server_pid" > server.pid
+
+    local wait_time=0
+    local version_checked=0
+    while [[ $wait_time -lt 90 ]]; do
+        if [[ -f "logs/latest.log" ]]; then
+            if [[ $version_checked -eq 0 ]] && grep -q "for Minecraft" logs/latest.log 2>/dev/null; then
+                if ! verify_runtime_version; then
+                    local vr=$?
+                    if [[ $vr -eq 3 ]]; then
+                        log ERROR "Version mismatch; stopping"
+                        kill "$server_pid" 2>/dev/null || true
+                        exit 1
+                    fi
+                    version_checked=1
+                else
+                    version_checked=1
+                fi
+            fi
+            if grep -q "Done" logs/latest.log 2>/dev/null; then
+                log OK "Server started (PID: $server_pid)"
+                break
+            fi
+        fi
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            log ERROR "Server process exited prematurely"; exit 1
+        fi
+        sleep 1
+        wait_time=$((wait_time + 1))
+        if [[ $((wait_time % 5)) -eq 0 ]]; then
+            log INFO "Waiting for server... (${wait_time}s)"
+        fi
+    done
+
+    if [[ $wait_time -ge 90 ]]; then
+        log ERROR "Server startup timeout"
+        exit 1
+    fi
+
+    log INFO "Following log (Ctrl+C to stop)"
+    tail -f logs/latest.log &
+    local tail_pid=$!
+    wait $tail_pid
+}
+
+# Parse optional flags (extend with interactive toggles)
+PARAMS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mc) PAPER_VERSION="$2"; shift 2 ;;
+        --paper-build) PAPER_BUILD="$2"; shift 2 ;;
+        --client-version) MC_CLIENT_VERSION="$2"; shift 2 ;;
+        --interactive) INTERACTIVE=1; shift ;;
+        --no-interactive) INTERACTIVE=0; shift ;;
+        --list-versions) list_paper_versions; exit 0 ;;
+        --) shift; break ;;
+        clean|build|test|server|help|run|"") break ;;
+        *) PARAMS+=("$1"); shift ;;
+    esac
 done
+set -- "${PARAMS[@]}" "$@"
 
-require() { command -v "$1" >/dev/null 2>&1 || { err "Missing required command: $1"; exit 1; }; }
-
-require java
-if (( DO_BUILD )); then require mvn; fi
-
-cd "$PROJECT_DIR"
-
-if [[ ! -f $SERVER_JAR ]]; then
-  err "Server jar '$SERVER_JAR' not found in $PROJECT_DIR. Download Paper (paper-<ver>-<build>.jar) and symlink or rename to $SERVER_JAR."
-  exit 1
-fi
-
-build_plugin(){
-  if (( ! DO_BUILD )); then
-    log "Skipping build (--no-build)"
-    return
-  fi
-  log "Cleaning & packaging plugin"
-  mvn -q clean package || { err "Maven build failed"; exit 1; }
+main() {
+    echo -e "${BLUE}ExfilCraft Development Server${NC}"
+    echo "=============================="
+    check_java
+    clean_build
+    compile_project
+    build_project
+    run_tests
+    start_server
 }
 
-stop_server(){
-  local pids
-  pids=$(pgrep -f "$SERVER_JAR" || true)
-  if [[ -z "$pids" ]]; then
-    log "Server not running"
-    return
-  fi
-  log "Stopping server (PIDs: $pids)"
-  # Try graceful TERM first
-  kill -TERM $pids || true
-  local waited=0
-  while kill -0 $pids 2>/dev/null; do
-    sleep 1
-    waited=$((waited+1))
-    if (( waited >= 30 )); then
-      err "Server still running after 30s, sending KILL"
-      kill -KILL $pids || true
-      break
-    fi
-  done
-  log "Server stopped"
-  rm -f "$PID_FILE"
-}
-
-deploy_plugin(){
-  mkdir -p plugins
-  log "Removing old plugin jars"
-  rm -f plugins/${PLUGIN_NAME}-*.jar || true
-  local built
-  # Prefer shaded jar if present
-  if built=$(ls -1 target/${PLUGIN_NAME}-*-shaded.jar 2>/dev/null | head -n1); then :; else
-    built=$(ls -1 target/${PLUGIN_NAME}-*.jar 2>/dev/null | grep -v 'original-' | head -n1 || true)
-  fi
-  if [[ -z "$built" || ! -f "$built" ]]; then
-    err "Built plugin jar not found in target/"
-    exit 1
-  fi
-  log "Deploying $(basename "$built") -> plugins/"
-  cp "$built" plugins/
-}
-
-start_server(){
-  if (( ! DO_START )); then
-    log "Skipping server start (--no-start)"
-    return
-  fi
-  if pgrep -f "$SERVER_JAR" >/dev/null 2>&1; then
-    err "Server already running; not starting another instance"
-    exit 1
-  fi
-  mkdir -p "$LOG_DIR"
-  local log_file="$LOG_DIR/latest-run.log"
-  log "Starting server (logging to $log_file)"
-  nohup java "${JAVA_ARGS[@]}" -jar "$SERVER_JAR" "${SERVER_ARGS[@]}" >"$log_file" 2>&1 &
-  local pid=$!
-  echo $pid > "$PID_FILE"
-  log "Server PID $pid"
-  # Quick readiness probe: wait until log contains 'Done (' or process dies
-  for i in {1..60}; do
-    if ! kill -0 $pid 2>/dev/null; then
-      err "Server process exited prematurely"
-      tail -n 50 "$log_file" >&2 || true
-      exit 1
-    fi
-    if grep -q 'Done (' "$log_file" 2>/dev/null; then
-      log "Server started (world loaded)"
-      break
-    fi
-    sleep 1
-  done
-  if (( FOLLOW )); then
-    log "Following log (Ctrl+C to detach)"
-    tail -n 50 -f "$log_file"
-  fi
-}
-
-main(){
-  build_plugin
-  stop_server
-  deploy_plugin
-  start_server
-  log "Cycle complete"
-}
-
-main "$@"
-
+# Handle arguments
+case "${1:-run}" in
+    "clean")
+        check_java
+        clean_build
+        ;;
+    "build")
+        check_java
+        clean_build
+        compile_project
+        build_project
+        ;;
+    "test")
+        check_java
+        run_tests
+        ;;
+    "server")
+        check_java
+        if [[ ! -f "$PLUGIN_JAR" ]]; then
+            log "ERROR" "No plugin found. Run 'build' first."
+            exit 1
+        fi
+        start_server
+        ;;
+    "help")
+        echo "Usage: ./RUN [options] [command]"; echo
+        echo "Options:";
+        echo "  --mc <ver>             Paper/Minecraft version (e.g. 1.21.8)";
+        echo "  --paper-build <num>    Specific Paper build number";
+        echo "  --client-version <ver> Exact client version to enforce (defaults to --mc)";
+        echo "  --interactive          Run server with interactive console (default)";
+        echo "  --no-interactive       Run server detached with log tail";
+        echo "  --list-versions        List available Paper versions";
+        echo;
+        echo "Commands:";
+        echo "  run (default)  Full workflow build + interactive server";
+        echo "  clean          Clean project";
+        echo "  build          Clean, compile and build";
+        echo "  test           Run tests only";
+        echo "  server         Start server (respects interactive flags)";
+        echo "  help           Show this help";
+        ;;
+    "run"|"")
+        main
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Use './RUN help' for usage"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,883 @@
+Title: ExfilCraft Core Goals & Knowledge Base
+Version: 2025-08-24.5
+FormatVersion: 2
+
+# === META ================================================================
+META:
+  project: ExfilCraft
+  phaseCurrent: 1
+  phaseNext: 2
+  buildSystem: Maven
+  languagePrimary: Kotlin
+  mcServer: Paper/Spigot
+  db: SQLite
+  kotlinTarget: JVM 17 (inferred)
+  lastUpdateEpoch: ${EPOCH}
+  maintainers: [tsuki]
+  license: MIT
+  currencyName: Credits
+  bunkerMaxDimCubes: 8
+  bunkerCubeEdge: 16
+  raidWorldReuse: false
+
+# === HIGH LEVEL STATUS SNAPSHOT =========================================
+STATUS:
+  bunker:
+    readiness: STABLE
+    verticalExpansion: MISSING
+    protectionCoverage: PARTIAL
+  raid:
+    readiness: MVP
+    decomposition: PLANNED
+    rewardHook: MISSING
+  team:
+    persistence: MISSING
+  profile:
+    baseFields: IMPLEMENTED
+    currencyAdjustHooks: MISSING
+  testing:
+    harness: MISSING
+  metrics:
+    framework: MISSING
+
+# === MACHINE INDEX (FOR AI PARSING) =====================================
+MACHINE_INDEX:
+  modules:
+    - id: core.ConfigService
+      path: core/ConfigService.kt
+      responsibilities: [configAccess, raidTemplatesParsing]
+    - id: bunker.BunkerService
+      path: bunker/BunkerService.kt
+      responsibilities: [allocation, expansion, teleport, invites]
+    - id: raid.RaidService
+      path: raid/RaidService.kt
+      responsibilities: [queue, worldGen, extraction, compass, admin]
+    - id: raid.RaidSession
+      path: raid/RaidSession.kt
+      responsibilities: [sessionState, timers]
+    - id: raid.RaidTemplate
+      path: raid/RaidTemplate.kt
+      responsibilities: [templateConfigModel]
+    - id: profile.ProfileService
+      path: profile/ProfileService.kt
+      responsibilities: [profileCRUD]
+    - id: team.TeamService
+      path: team/TeamService.kt
+      responsibilities: [teamRuntime, invites]
+    - id: db.DatabaseService
+      path: db/DatabaseService.kt
+      responsibilities: [connection, migrations, queries]
+  raidServiceLOCApprox: 1500
+  bunkerServiceLOCApprox: 420
+  monolithHotspot: raid.RaidService
+
+# === DOMAIN OBJECTS =====================================================
+DOMAIN_OBJECTS:
+  Bunker:
+    fields: [id, ownerUuid, originChunkX, originChunkZ, startY, cubeSize, cubesCount, lastExpansionTs, createdAt, updatedAt]
+    invariants:
+      - cubeSize == config.bunkerCubeSize
+      - cubesCount == count(bunker_cube rows for bunker)
+  BunkerCube:
+    fields: [bunker_id, dx, dy, dz]
+    invariants:
+      - unique (bunker_id, dx, dy, dz)
+      - 0 <= abs(dx|dy|dz) < bunkerMaxDimCubes (after vertical implementation)
+  RaidSession:
+    fields: [id, world, players, state, startedAtEpoch, durationSeconds, extractionAvailableAt, extractionPoint, extractionRadius, channelSecondsRequired, bossBar, perPlayerChannelRemaining, extracted, dead, flags]
+    invariants:
+      - state != ENDED => world loaded
+      - extracted ∩ dead = ∅
+      - perPlayerChannelRemaining[p] >= 0 until extraction success
+  PlayerProfile:
+    fields: [uuid, totalXp, currency, unlocksJson, lastRaidTs, lastBunkerX/Y/Z, starterGiven]
+  Team:
+    fields: [leader, members]
+
+# === CONFIG KEYS (SELECT) ===============================================
+CONFIG_KEYS:
+  bunker.worldName: {type: String, default: exfil_bunkers}
+  bunker.expansionCubeSize: {type: Int, default: 16}
+  bunker.expansionCooldownMinutes: {type: Long, default: 10}
+  bunker.maxCubes: {type: Int, default: 512}
+  bunker.rules.initialHorizontalLimit: {type: Int, default: 9}
+  raid.minPlayers: {type: Int, default: 1}
+  raid.maxConcurrentSessions: {type: Int, default: 10}
+  raid.durationMinutes: {type: Int, default: 10}
+  raid.extraction.channelSeconds: {type: Int, default: 10}
+  raid.extraction.radius: {type: Double, default: 3.0}
+  raid.queue.autoStart: {type: Boolean, default: true}
+  communications.raid.bossBar: {type: Boolean, default: true}
+
+# === GAP MATRIX (DELTA VIEW) ============================================
+GAPS_COMPACT:
+  - id: G1
+    area: bunker.verticalExpansion
+    current: absent
+    target: full 3D adjacency up to 8^3
+    risk: MEDIUM
+  - id: G2
+    area: bunker.protection
+    current: partial listeners
+    target: full boundary enforcement (block place/break, fluid, piston, explosion, hopper, pearl)
+    risk: HIGH
+  - id: G3
+    area: raid.modularity
+    current: monolith
+    target: 4 services (queue, world, extraction, registry)
+    risk: HIGH
+  - id: G4
+    area: raid.rewardHook
+    current: none
+    target: XP + currency grant + profile update
+    risk: MEDIUM
+  - id: G5
+    area: team.persistence
+    current: memory only
+    target: DB schema + migration + load on start
+    risk: MEDIUM
+  - id: G6
+    area: testing.harness
+    current: absent
+    target: MockBukkit based module
+    risk: HIGH
+  - id: G7
+    area: metrics.framework
+    current: absent
+    target: in-memory registry + optional log sink
+    risk: MEDIUM
+
+# === BACKLOG (STRUCTURED) ===============================================
+# Fields: id, title, priority(P1..P4), status, depends, area, description, acceptance
+BACKLOG:
+  - id: T1
+    title: Implement vertical bunker expansion
+    priority: P1
+    status: PLANNED
+    depends: []
+    area: bunker
+    description: Allow adding cubes with dy +-1 respecting max dimension 8 and face adjacency.
+    acceptance:
+      - Can /bunker extend up produce dy layer
+      - cubes_count increments and bunker_cube inserted
+      - Carved volume matches startY + dy*cubeSize
+  - id: T2
+    title: Enforce global bunker dimension boundaries
+    priority: P1
+    status: PLANNED
+    depends: [T1]
+    area: bunker
+    description: Validate max extents per axis < 8 cubes and total <= 512.
+    acceptance: [Reject expansion beyond limit, message shown]
+  - id: T3
+    title: Protection listeners full coverage
+    priority: P1
+    status: PLANNED
+    depends: []
+    area: bunker
+    description: Cancel disallowed events outside bunker cubes.
+    acceptance: [All listed events blocked in tests]
+  - id: T4
+    title: Split RaidService into modular services
+    priority: P1
+    status: PLANNED
+    depends: [T6]
+    area: raid
+    description: Extract queue, world, extraction, registry components.
+    acceptance: [Existing commands functional, class sizes reduced]
+  - id: T5
+    title: Extraction reward hook
+    priority: P2
+    status: PLANNED
+    depends: [T6]
+    area: raid
+    description: On extraction, award XP and currency to profile.
+    acceptance: [Profile totalXp and currency increase]
+  - id: T6
+    title: Introduce test harness (MockBukkit)
+    priority: P1
+    status: PLANNED
+    depends: []
+    area: testing
+    description: Add test module and initial tests for bunker allocation and expansion cost.
+    acceptance: [mvn test passes with >=2 tests]
+  - id: T7
+    title: Metrics registry + basic counters
+    priority: P2
+    status: PLANNED
+    depends: []
+    area: metrics
+    description: In-memory counters with periodic log flush.
+    acceptance: [Counters visible in log on shutdown]
+  - id: T8
+    title: Team persistence schema
+    priority: P2
+    status: PLANNED
+    depends: []
+    area: team
+    description: Add tables team(team_id, leader_uuid, created_at) and team_member.
+    acceptance: [Reload retains teams]
+  - id: T9
+    title: /raid leave command
+    priority: P3
+    status: PLANNED
+    depends: []
+    area: raid
+    description: Allow players to voluntarily leave before extraction with penalty.
+    acceptance: [Player removed, penalty applied]
+  - id: T10
+    title: Structured logger with rate limiting
+    priority: P3
+    status: PLANNED
+    depends: []
+    area: core
+    description: Replace ad-hoc log() with context-aware logger supporting debug gating.
+    acceptance: [Logger tests pass, spam suppressed]
+
+# === METRICS SPEC ========================================================
+METRICS:
+  counters:
+    - id: raid.active.sessions
+      source: RaidSessionRegistry
+      update: on session start/end
+    - id: raid.extraction.success
+      source: ExtractionService
+      update: on successful extraction
+    - id: raid.extraction.attempt
+      source: ExtractionService
+      update: on channel tick within radius (first tick per player)
+    - id: bunker.expansion.success
+      source: BunkerService
+      update: expansion success
+    - id: bunker.expansion.fail
+      source: BunkerService
+      update: expansion attempt rejected
+    - id: protection.violations
+      source: ProtectionListeners
+      update: each cancelled event
+  timers:
+    - id: raid.world.gen.ms
+      start: pre createTemplateWorld
+      stop: post world ready
+    - id: extraction.channel.ms
+      start: first tick inside radius
+      stop: extracted or reset
+
+# === EVENT HOOK PLAN =====================================================
+EVENTS:
+  bunkerExpansion:
+    payload: {playerUuid, bunkerId, newCube: {dx,dy,dz}, totalCubes}
+  raidSessionStart:
+    payload: {sessionId, templateId, playerCount}
+  raidSessionEnd:
+    payload: {sessionId, reason, extractedCount, deadCount}
+  extractionSuccess:
+    payload: {sessionId, playerUuid, templateId}
+  protectionViolation:
+    payload: {playerUuid, type, location}
+
+# === TEST PLAN (INITIAL) ================================================
+TEST_PLAN:
+  harness: MockBukkit
+  cases:
+    - id: TB1
+      title: Bunker auto allocation sets initial cube
+      area: bunker
+      asserts: [bunker_cube row (0,0,0), cubes_count=1]
+    - id: TB2
+      title: Expansion cost increments linearly
+      area: bunker
+      asserts: [cost for 2nd=base*1, 3rd=base*2]
+    - id: TB3
+      title: Expansion cooldown enforced
+      area: bunker
+      asserts: [2nd expansion within cooldown rejected]
+    - id: TR1
+      title: Raid start auto when min reached
+      area: raid
+      asserts: [session created, players teleported]
+    - id: TR2
+      title: Extraction unlock after time condition
+      area: raid
+      asserts: [extraction availableAt respected]
+
+# === ROADMAP STRUCTURED ==================================================
+ROADMAP:
+  milestones:
+    - id: M-A
+      name: Phase1 Hardening
+      includes: [T1, T2, T3, T6]
+      exitCriteria: [vertical expansion works, protection listeners complete, tests pass]
+    - id: M-B
+      name: Raid Modularization
+      includes: [T4, T5, T9]
+      exitCriteria: [RaidService LOC < 600, reward hook verified]
+    - id: M-C
+      name: Metrics & Persistence
+      includes: [T7, T8, T10]
+      exitCriteria: [metrics logged, team survives reload]
+    - id: M-D
+      name: Progression Kickoff
+      includes: []
+      exitCriteria: [economy accrual path]
+
+# === RISK REGISTER (STRUCT) =============================================
+RISKS_STRUCT:
+  - id: R1
+    name: RaidService Monolith
+    prob: 0.6
+    impact: 0.8
+    score: 0.48
+    mitigation: Decompose (T4)
+  - id: R2
+    name: Missing Protection
+    prob: 0.7
+    impact: 0.9
+    score: 0.63
+    mitigation: Implement listeners (T3)
+  - id: R3
+    name: Vertical Expansion Delay
+    prob: 0.5
+    impact: 0.6
+    score: 0.30
+    mitigation: Prioritize T1 early
+  - id: R4
+    name: Lack Tests
+    prob: 0.8
+    impact: 0.8
+    score: 0.64
+    mitigation: Test harness (T6)
+  - id: R5
+    name: Reward Exploit Risk
+    prob: 0.3
+    impact: 0.7
+    score: 0.21
+    mitigation: Single-flight extraction guard
+
+# === CHANGELOG (APPENDED) ===============================================
+CHANGELOG:
+  - ver: 2025-08-24.5
+    notes:
+      - Added state machine specs (bunker expansion, raid lifecycle)
+      - Added protection matrix with enforcement status
+      - Added decisions log for key architectural choices
+      - Added complexity & performance budgets
+      - Added dependency graph coarse-grain
+      - Added backlog scoring (value vs effort vs risk)
+      - Added quality gates definition
+  - ver: 2025-08-24.4
+    notes:
+      - Added machine-readable sections (META, MACHINE_INDEX, BACKLOG, METRICS, EVENTS, TEST_PLAN)
+      - Structured risks with scores
+      - Created formal backlog with IDs & dependencies
+      - Added metrics & event instrumentation plan
+  - ver: 2025-08-24.3
+    notes: [See legacy section below]
+
+# === STATE MACHINES =====================================================
+STATE_MACHINES:
+  bunkerExpansionAttempt:
+    states: [Idle, Validating, ChargingXP, Carving, Persisting, CooldownSet, Completed, Failed]
+    transitions:
+      - Idle -> Validating (player issues /bunker extend)
+      - Validating -> ChargingXP (checks pass)
+      - Validating -> Failed (invalid direction / limit / cooldown)
+      - ChargingXP -> Carving (XP deducted)
+      - ChargingXP -> Failed (insufficient XP)
+      - Carving -> Persisting (blocks carved in memory/world)
+      - Persisting -> CooldownSet (DB row inserted + bunker updated)
+      - CooldownSet -> Completed (success message)
+      - any -> Failed (exception)
+    idempotency: persist step must be single transaction (future change)
+  raidLifecycle (future refined):
+    states: [Preparing, SpawnProtection, Active, ExtractionOpen, Ending, Ended]
+    transitions:
+      - Preparing -> SpawnProtection (players teleported)
+      - SpawnProtection -> Active (protection timer elapses)
+      - Active -> ExtractionOpen (time condition or dragon defeat)
+      - Active -> Ending (timeout)
+      - ExtractionOpen -> Ending (all players extracted OR timeout)
+      - Ending -> Ended (cleanup scheduled executed)
+    invariants:
+      - ExtractionOpen implies extractionAvailableAt <= now
+      - Ended implies world scheduled for unload/deleted
+
+# === PROTECTION MATRIX ==================================================
+PROTECTION_MATRIX:
+  categories:
+    - id: BLOCK_PLACE
+      outsideAction: cancel
+      status: PENDING
+    - id: BLOCK_BREAK
+      outsideAction: cancel
+      status: PENDING
+    - id: EXPLOSION_BLOCK_DAMAGE
+      outsideAction: filter blocks outside
+      status: PENDING
+    - id: FLUID_FLOW
+      outsideAction: cancel source update crossing boundary
+      status: PENDING
+    - id: PISTON_EXTEND
+      outsideAction: cancel if pushing outside->inside or inside->outside
+      status: PENDING
+    - id: HOPPER_TRANSFER
+      outsideAction: cancel cross-boundary inventory move
+      status: PENDING
+    - id: ENDER_PEARL_TELEPORT
+      outsideAction: cancel into bunker from outside
+      status: PENDING
+    - id: ENTITY_SPAWN_HOSTILE
+      outsideAction: remove if inside bunker (config rule)
+      status: PARTIAL (rule sets DO_MOB_SPAWNING false)
+    - id: FIRE_SPREAD
+      outsideAction: cancel across boundary
+      status: PENDING
+
+# === DECISIONS_LOG =====================================================
+DECISIONS_LOG:
+  - id: D1
+    title: Separate bunker world vs shared region in overworld
+    choice: Dedicated world
+    rationale: Simplifies protection boundary and chunk math
+    status: ACCEPTED
+  - id: D2
+    title: Per-raid temporary worlds vs reusable
+    choice: Temporary
+    rationale: Avoid cross-session contamination, simpler cleanup
+    status: ACCEPTED
+  - id: D3
+    title: Linear expansion XP cost formula
+    choice: cost = base * currentCubes
+    rationale: Predictable scaling, simple messaging
+    status: ACCEPTED
+  - id: D4
+    title: Single monolithic RaidService initially
+    choice: Monolith first
+    rationale: Speed of MVP; plan decomposition later (T4)
+    status: ACCEPTED_REVISIT
+  - id: D5
+    title: SQLite embedded storage
+    choice: SQLite
+    rationale: Simplicity for single-server deployment
+    status: ACCEPTED
+
+# === COMPLEXITY_BUDGET ==================================================
+COMPLEXITY_BUDGET:
+  classLOC:
+    raid.RaidService: {current: 1500, target: 600}
+    bunker.BunkerService: {current: 420, target: 500_max}
+  methodMaxLinesTarget: 80
+  cyclomaticHotspotsReview: [RaidService.tick, RaidService.startSession]
+  queryLatencyTargetsMs:
+    bunkerAllocation: 5
+    expansionPersist: 5
+  worldGenBudgetMs: 200 (per attempt average)
+
+# === DEP_GRAPH (COARSE) ================================================
+DEP_GRAPH:
+  nodes: [ConfigService, DatabaseService, ProfileService, TeamService, BunkerService, RaidService]
+  edges:
+    - from: BunkerService
+      to: [DatabaseService, ConfigService, ProfileService]
+    - from: RaidService
+      to: [ConfigService, BunkerService, TeamService]
+    - from: ProfileService
+      to: [DatabaseService]
+    - from: TeamService
+      to: []
+    - from: ConfigService
+      to: []
+    - from: DatabaseService
+      to: []
+  cycles: []
+  notes: After decomposition RaidService edges will distribute
+
+# === BACKLOG_SCORING ====================================================
+# score model: value(1-5)*riskReduction(1-5) / effort(1-5)
+BACKLOG_SCORING:
+  - id: T1
+    value: 5
+    riskReduction: 3
+    effort: 3
+    score: 5
+  - id: T3
+    value: 5
+    riskReduction: 5
+    effort: 4
+    score: 6.25
+  - id: T4
+    value: 4
+    riskReduction: 4
+    effort: 5
+    score: 3.2
+  - id: T6
+    value: 5
+    riskReduction: 5
+    effort: 3
+    score: 8.33
+  - id: T7
+    value: 4
+    riskReduction: 3
+    effort: 2
+    score: 6
+
+# === QUALITY_GATES ======================================================
+QUALITY_GATES:
+  gate1: Build passes (mvn package) with zero compilation errors
+  gate2: Tests >= 80% pass rate (initial minimal set) and no failing critical tests
+  gate3: No class > target LOC budget unless annotated @AllowLargeClass
+  gate4: All migrations repeatable on empty DB & idempotent
+  gate5: No unchecked exceptions escape command handlers (log & message player)
+  gate6: Raid world count <= active sessions + leakedThreshold (1) else warn
+  gate7: Protection matrix coverage 100% implemented events marked DONE
+
+# === LEGACY NARRATIVE (PREVIOUS VERSION CONTENT) ========================
+Title: ExfilCraft Core Goals & Knowledge Base
+Version: 2025-08-24.3
+
+STATUS SUMMARY
+Current Phase: Phase 1 stabilization with Early Phase 2 raid MVP overlap.
+Execution Snapshot: Bunkers production‑ready core; RaidService MVP (queue, world generation, spawn protection, extraction, compass, cleanup) functional but monolithic.
+Overall Confidence: High for bunker domain; Medium for raid domain (complexity + limited tests).
+Primary Active Risks: (1) RaidService monolith (scope creep) (2) Protection coverage gaps (pistons / fluids / explosions) (3) Vertical & large bunker expansion not implemented vs spec (4) Lack of automated regression tests (5) World provisioning perf under edge seeds.
+
+---
+SECTION 1. Repository Implementation Inventory
+Core Modules:
+- core: ConfigService (dynamic reload), ServiceRegistry (not yet reviewed here)
+- db: SQLite wrapper + migration system (migrations 1..4 applied)
+- bunker: BunkerService (allocation, caching, invite, ownership transfer, horizontal expansion only, cooldown, XP cost, teleport)
+- raid: RaidService (queue(s), template menu GUI, world provisioning, spawn safety, extraction logic, boss bar, compass, administrative commands), RaidSession, RaidTemplate
+- team: TeamService (in‑memory only; no persistence)
+- profile: ProfileService (player_profile table CRUD)
+- world: BunkerWorldGenerator (flat layered), WorldManagerService (not inspected yet — add review),
+- command: BunkerCommand, RaidCommand, TeamCommand, AdminCommand, ExfilCommand (not all inspected this revision)
+- listener: (Not enumerated in this pass; add to next maintenance cycle)
+
+SECTION 2. Data Schema Snapshot (SQLite)
+Tables & Purpose:
+- player_profile(uuid PK, total_xp, currency, unlocks JSON, last_raid_ts, last_bunker_x/y/z, created_at, updated_at, starter_given)
+- bunker(id PK, owner_uuid UNIQUE, origin_chunk_x/z, start_y, cube_size, cubes_count, last_expansion_ts, created_at, updated_at)
+- bunker_member(bunker_id, member_uuid, role)
+- bunker_invite(id PK, bunker_id, invitee_uuid, inviter_uuid, created_at, expires_at, accepted)
+- bunker_cube(bunker_id, dx, dy, dz)  // current expansions stored; only dy=0 used presently
+Indexes: idx_bunker_owner, idx_invite_inv, idx_bunker_cube_bid.
+Missing (planned): raid_outcome, team persistence, metrics counters.
+
+SECTION 3. Spec vs Implementation Gap Matrix
+Bunkers:
+- Spec: Vertical & horizontal expansion up to 8x8x8 (512 cubes). Impl: Horizontal only within limited range (dx,dz in -1..1); vertical not implemented; effective cap 9 cubes due to ruleInitialHorizontalLimit default 9 and -1..1 guard.
+- Spec: Face adjacency enforcement. Impl: Adjacency enforced implicitly by choosing from current cube + direction; no global adjacency check beyond single step (OK for horizontal; vertical absent).
+- Spec: Max size 8x8x8. Impl: No enforcement except horizontal limit; cubes_count grows unconstrained if logic expanded later.
+- Spec: Expansion cost 100 * current cube count. Impl: nextExpansionCostXp = expansionCostBaseXp * current cubes_count (config default 100) => MATCH.
+- Spec: Both horizontal and vertical allowed. Impl: Vertical missing.
+- Spec: Protection forbids pistons, explosions, fluids, redstone propagation outside cube bounds. Impl: Not fully implemented (listeners not audited in this edit).
+- Spec: Ownership transfer allowed. Impl: transferOwnership present (requires new owner already member) - OK.
+
+Raid:
+- Spec: Immediate auto-start when minPlayers reached (config). Impl: raid.queue.autoStart honored True => immediate or countdown (countdown logic present when autoStart false).
+- Spec: Opposite side spawn vs extraction farthest. Impl: Farthest vector spawn selection implemented via opposite direction from extraction.
+- Spec: Timer global; extraction unlock condition time or dragon kill. Impl: Both supported via ExtractionUnlockCondition.
+- Spec: Particles HAPPY_VILLAGER; boss bar time. Impl: Configured particle, boss bar with color & countdown.
+- Spec: Post extraction teleport to bunker center; compass removed. Impl: teleportToBunker removes extraction compass.
+- Spec: Items drop on timeout death. Impl: On timeout endSession sets player.health=0.; drop semantics depend on server (items drop) — acceptable.
+- Spec: /raid leave to be added. Impl: NOT implemented.
+- Spec: Distinct states PREPARING, EXTRACTION_OPEN. Impl: Only WAITING, ACTIVE, ENDED plus flags.
+- Spec: Reward hook XP/currency on extraction. Impl: NOT implemented.
+
+Teams:
+- Spec: Persistence & invites integrated with bunkers / raids. Impl: In-memory only; no DB persistence; not integrated with bunker membership beyond queue grouping.
+
+Profiles:
+- Spec: Track total XP, currency, unlocks, last raid time, bunker last location. Impl: Fields exist; update hooks for currency / last raid pending.
+
+SECTION 4. Feature Pillars – Updated Status
+1. Platform & Services – Stable
+2. Player Profiles & Bunkers – Core implemented; vertical expansion & full protection HARDENING pending
+3. Matchmaking & Session Lifecycle – MVP; needs state refinement & modularization
+4. Extraction Mechanics – Functional; reward + metrics pending
+5. Loot & Economy – NOT STARTED
+6. Progression & Unlock System – NOT STARTED
+7. Auction House & Advanced Economy – NOT STARTED
+8. Integrations & NPCs – NOT STARTED
+9. Combat/AI Enhancements – NOT STARTED
+10. Observability & Hardening – PARTIAL (logging only)
+
+SECTION 5. Architecture Decomposition Plan (Target)
+Refactor RaidService into:
+- RaidQueueService (template queues, matchmaking, menu refresh)
+- RaidWorldService (world provisioning, spawn safety, structure scanning)
+- RaidExtractionService (extraction unlock logic, channeling, reward hook)
+- RaidSessionRegistry (lifecycle, boss bar updates, cleanup) // thin orchestrator
+Timeline: Begin after baseline tests for existing behavior (bunker allocation, extraction success path).
+
+SECTION 6. Immediate Action Items (Reclassified)
+Legend: [DONE] [IN PROGRESS] [PENDING] [NEW]
+Bunker / Phase 1:
+- /bunker invite + /bunker accept flows (expiry) – [DONE] (expiry purge on use; add scheduled purge interval) [IMPROVE]
+- Team membership persistence & ownership transfer – [PENDING] (ownership transfer exists; persistence missing)
+- Expansion XP cost formula application – [DONE]
+- Vertical expansion support (dy ±1) with adjacency & max 8x8x8 enforcement – [NEW]
+- Remove hardcoded -1..1 range; compute bounds from discovered cubes & max size – [NEW]
+- Protection listeners (pistons, explosions, fluid flow, pearls, hoppers) – [PENDING]
+- Automated test: bunker auto-allocation – [PENDING]
+- Automated test: expansion adjacency & XP cost – [PENDING]
+- Automated test: invite lifecycle & expiry – [PENDING]
+- Config reload hook re-applies expansion cost & raid params live – [PENDING]
+- Standardize log prefix [ExfilCraft] – [PENDING]
+- Crash recovery doc for partial bunker (allocation + cube insertion atomicity) – [PENDING]
+- Schema migration version audit before new tables – [IN PROGRESS] (migrations 1..4 ok)
+- Vertical cube carving routine & data persistence (dy) – [NEW]
+Raid / Early Phase 2:
+- Extract RaidService responsibilities (see Section 5) – [PENDING]
+- Add refined RaidState enum (PREPARING, ACTIVE, EXTRACTION_OPEN, COMPLETED, FAILED) – [NEW]
+- /raid leave command with penalty logic – [NEW]
+- Persist raid outcome summary (in-memory first) – [NEW]
+- Extraction reward hook (XP/currency adjustment) – [NEW]
+- Metrics counters (activeRaids, extractionSuccessRate, spawnProtectionViolations) – [NEW]
+- Async / cached perimeter candidate generation – [PENDING]
+- Cleanup verification test (world unload, player detachment) – [PENDING]
+- Spawn protection test (no early deaths, damage blocked) – [PENDING]
+Cross-Cutting:
+- Introduce MockBukkit or Paper test harness module – [NEW]
+- Metrics backend abstraction (simple in-memory + future Prometheus adapter) – [NEW]
+- Structured logger (levels, rate limiting, context tags) – [PENDING]
+
+SECTION 7. Near-Term Design Decisions
+Vertical Expansion Data Model: reuse bunker_cube (dx,dy,dz) with dy increments; enforce bounds via config max dimension (8) and adjacency test (face share). Carving method must consider Y offset: startY + dy*cubeSize.
+State Enum Migration: Extend RaidSession; add migration path w/o DB persistence initially; ephemeral only.
+
+SECTION 8. Metrics Plan (Expanded)
+Counters / Gauges:
+- activeRaidSessions
+- raidWorldGenAttempts (sum, success ratio)
+- spawnProtectionViolations
+- extractionAttempts / extractionSuccesses
+- oceanWorldRejectRate
+- bunkerExpansions (success/fail reasons)
+- compassIssuedCount
+Timers:
+- raidWorldGenLatencyMs
+- extractionChannelDurationMs (per player)
+Distribution Samples:
+- spawnSafetyAttempts (radial vs square) counts per session
+
+SECTION 9. Risk Register (Updated)
+R1 RaidService Monolith Complexity – High – Refactor plan Section 5.
+R2 Incomplete Protection Coverage – High – Add listeners & tests.
+R3 Expansion Spec Drift (vertical missing, size cap) – Medium – Implement vertical + enforcement.
+R4 Lack of Automated Tests – High – Add harness & core tests.
+R5 World Provisioning Latency – Medium – Monitor & pre-gen optimization.
+R6 Data Corruption mid-expansion – Medium – Wrap expansion in transaction w/ revert on failure.
+R7 Invite Expiry Enforcement (no periodic purge) – Low – Add scheduled cleanup task.
+R8 Extraction Scan Performance Spikes – Low-Med – Add latency metric & threshold alert.
+R9 Queue/Template Race Conditions – Low – Isolate queue code to its service.
+R10 Team Persistence Missing – Medium – Add DB schema + migration.
+
+SECTION 10. Roadmap (Rolling)
+Milestone A (Finish Phase 1 hardening): protection listeners, vertical expansion, tests (allocation/expansion/invite), logging standard, config reload improvements.
+Milestone B (Raid modularization): split services, refined states, /raid leave, outcome summary, reward hook.
+Milestone C (Metrics & Persistence): metrics scaffold, raid_outcome table, team persistence.
+Milestone D (Progression & Economy Kickoff): reward balancing, currency accrual, unlock evaluation.
+
+SECTION 11. Change Log (Incremental)
+2025-08-24.3
+- Added structured spec vs implementation gap matrix
+- Classified action items with statuses & added new vertical expansion tasks
+- Documented data schema snapshot & missing tables
+- Added architecture decomposition target & roadmap milestones
+- Updated risk register (monolith / vertical expansion gap prioritized)
+2025-08-24.2 (previous)
+- Surface-only extraction algorithm, spawn protection, opposite spawn, boss bar highlight, compass lifecycle cleanup, ocean-heavy rejection, method dedup, cross-world distance guard.
+
+SECTION 12. Maintenance Guidance
+Next version (.4) AFTER: (a) Protection listener coverage implemented AND (b) At least two automated tests added AND (c) Vertical expansion prototype committed.
+
+END OF FILE
+
+
+PHASE 1 Q
+
+Bunker World / Layout
+Use existing overworld, or create a dedicated world (void / flat) for all bunkers?
+- dedicated world (NAME exfil_bunkers)
+If dedicated world: preferred generation type (void, flat, normal)?
+- create a FLAT with bedrock floor at Y=-64, deepslate to Y=0, stone above and bedrock ceiling at Y=320
+- 16x16 chunks (256x256 blocks) world border, bunker grid aligned to chunk borders
+Grid layout: base footprint 16x16. What spacing gap between bunkers (e.g. 4 blocks)?
+- first room at (0,0) chunk, players other bunkers spawn with at least 64 chunks (1024 blocks) apart in X/Z from any existing bunker
+Vertical range: starting cube Y range (give base Y and height). OK with fixed height (e.g. Y=64..79)?
+- base Y=64, height=16 (Y=64..79)
+Allocation & Expansion
+Expansion increments: 16 -> 24 -> 32 -> ... up to 64, or only powers of two (16, 32, 48, 64)?
+- Players can expand (add) a new 16x16x16 cube adjacent to any existing cube, up to max size
+Max bunker size (e.g. 64x64x64)?
+- max 8x8x8 cubes (128x128x128 blocks)
+Expansion cost formula basis: linear, quadratic, or table-driven config?
+- each new cube costs 100 XP * current total cubes (e.g. 2nd cube 200 XP, 3rd cube 300 XP, etc)
+
+Allow vertical expansion or horizontal only?
+- both horizontal and vertical allowed
+Expansion direction restrictions (e.g. must be adjacent to existing cube)?
+- new cube must share a full face with an existing cube (no diagonal or stacked-only)
+Expansion cooldown (minutes) between expansions?
+- 10 minutes cooldown between expansions
+Expansion rollback (yes/no) if player dies in raid before next expansion?
+- no rollback
+Protection Rules
+Disallow all interaction outside bunker: include explosions, piston extension, fluids flowing out/in?
+- yes, all interaction blocked outside bunker
+Allow ender pearl teleport into bunker (yes/no)?
+- no
+Should hopper/item transfer across boundary be blocked?
+- yes
+Allow placing blocks that extend outside bunker (yes/no)?
+- no
+Allow breaking blocks that extend outside bunker (yes/no)?
+- no
+Allow entities (mobs, item frames, armor stands) to exist outside bunker (yes/no)?
+- no
+Allow placing containers (chests, barrels) that extend outside bunker (yes/no)?
+- no
+Allow placing redstone components that extend outside bunker (yes/no)?
+- no
+Allow placing light sources (torches, glowstone) that extend outside bunker (yes/no)?
+- no
+Allow placing fluids (water, lava) that extend outside bunker (yes/no)?
+- no
+Teams / Access
+Max members per bunker (owner + how many)?
+- max 4 members total (owner + 3)
+Should team members share XP and currency (yes/no)?
+- no, each player has their own XP and currency
+Allow team members to invite others (yes/no)?
+- yes, any member can invite others
+Allow team members to remove others (yes/no)?
+- yes, any member can remove others except the owner
+Should owner be able to leave bunker, passing ownership to another member (yes/no)?
+- yes, owner can leave and pass ownership to another member
+Can a player belong to multiple bunkers (yes/no)?
+- no, a player can only belong to one bunker at a time
+Commands (bunker)
+Preferred root command alias besides /exfil bunker (e.g. /exf b, /bunker)?
+- /bunker
+Should /bunker create be allowed manually or always auto-create on first join?
+- always auto-create on first join
+Should /bunker invite accept have an expiry time (yes/no)?
+- yes, invites expire after 60 minutes
+Invite expiry time (minutes) or none?
+- 60 minutes
+Should /bunker info show team members (yes/no)?
+- yes
+Should /bunker info show bunker size and coordinates (yes/no)?
+- yes
+Should /bunker info show expansion cooldown remaining (yes/no)?
+- yes
+Profile & Data
+SQLite file path preference (plugins/ExfilCraft/data.db ?)
+- plugins/ExfilCraft/data.db
+Should player profile be auto-created on first join (yes/no)?
+- yes
+Should player profile store total XP earned (yes/no)?
+- yes
+Should player profile store total currency earned/spent (yes/no)?
+- yes
+Should player profile store unlocks earned (yes/no)?
+- yes
+Should player profile store last raid timestamp (yes/no)?
+- yes
+Any need to store player last known bunker location for safe return? (yes/no)
+- yes, players are only in bunkers when they join/leave raids, except they are on market or other bunkers
+Commands (initial)
+Preferred root command alias besides /exfil (e.g. /exf, /bunker)?
+- /exfil
+Should /exfil bunker create be allowed manually or always auto-create on first join?
+- always auto-create on first join
+Should /exfil version show plugin version and authors (yes/no)?
+- yes
+Performance / Async
+Accept slight delay (async) on first join while bunker allocates (yes/no)? If no, pre-generate a batch?
+- yes, slight delay acceptable
+Async world prep for raids (yes/no)?
+- yes
+Max concurrent async world preps (e.g. 2, 4, 8)?
+- max 4 concurrent async world preps
+Should matchmaking queue be async (yes/no)?
+- yes
+Logging / Config
+Preferred config format (YAML, JSON, HOCON)?
+- YAML
+Config file name (config.yml default)?
+- config.yml
+Should config have a debug logging toggle (yes/no)?
+- yes
+Should config have economy base currency name (yes/no)?
+- yes, currency name "Credits"
+Should config have max concurrent raid sessions (yes/no)?
+- yes, default max 10 concurrent raid sessions
+Misc
+MIT license header in source files (yes/no)?
+- yes
+Config reload should also re-read expansion costs live (yes/no)?
+- yes
+Debug logging default on for development (yes/no)?
+- yes
+
+World Handling:
+Should each raid use a brand new temporary world folder deleted afterward, or reuse a single resettable “raid_world”? (Temporary per session assumed; confirm.)
+- temporary per session
+Accept a simple void/flat/normal world for MVP? (You didn’t specify terrain type—use NORMAL generator for now or a flat preset?)
+- NORMAL with dense structures
+Inventory & Death:
+On failure timeout, should items drop on ground in raid world (allow others to loot in future multiparty) or be fully deleted? For solo MVP I'd delete (clear).
+- drop on ground
+On extraction, do we need to record earned XP/currency now, or just safe return? (Assume none yet.)
+- safe return and record earned XP/currency
+On player death in raid, should we immediately teleport to bunker (with loss) or wait for timeout? (Assume immediate teleport.)
+- immediate teleport
+Extraction Placement:
+“Other side of the map”: For a square 256x256 area, if spawn chosen randomly, should extraction be farthest corner from that spawn, or predefine at fixed opposite corner (e.g., (border - margin, border - margin))? Farthest corner algorithm or deterministic corner?
+- farthest corner algorithm
+Should extraction point be on ground (Y=surface) or allow air (e.g., floating island)? (Assume ground.)
+- ground
+Extraction Timing:
+- Channeling time before extraction opens (10% of total timer, e.g., 1 min on 10 min)
+Extraction Radius Rules:
+If player steps out of radius, reset progress? (Assume yes.)
+- yes
+Is taking damage inside radius allowed or should it abort? (Assume allowed for MVP.)
+- allowed, if dying inside radius, player dies
+Timer Source:
+Use one global session timer (10 min) vs. individual? (Global assumed.)
+- global session timer
+Command Scope:
+Only /raid start for now, or also /raid status and /raid leave (emergency exit)? (Recommend adding /raid leave to allow early abort.)
+- add /raid status, no other method for extraction should be allowed for now
+Minimum Players:
+Config key name preference? (suggest: raid.minPlayers, default 1.)
+- raid.minPlayers, default 1
+Should queue auto-start when min met immediately, or allow brief grace period to add more players? (Immediate for MVP.)
+- immediate
+Concurrency Limits:
+Cap concurrent active raid sessions (config: raid.maxConcurrent, default maybe 10)? (Needed to prevent world spam.)
+- yes, raid.maxConcurrent, default 10
+Difficulty Enforcement:
+Set world difficulty HARD and lock? (Prevent players changing.)
+- yes, set to HARD and lock
+Visual Timer Method:
+Action bar okay for MVP? (Simplest; BossBar later.)
+- BOSS BAR with percentage and time remaining
+Extraction Indicator:
+“Green smoke”: Use PARTICLE HAPPY_VILLAGER periodically at extraction radius edge? Or spawn colored dust? (Clarify preference.)
+- PARTICLE HAPPY_VILLAGER periodically at extraction radius edge
+Post-Extraction Teleport Destination:
+Always bunker center (like teleportToBunker) or last bunker saved location (profile)? (Assume bunker center.)
+- bunker center
+Cleanup Delay:
+Immediately unload/delete world after session ends or wait a short delay (e.g., 5s) for observers/logs? (Immediate assumed.)
+- short delay of 5s
+Permissions:
+Should /raid start require a permission (exfil.raid.start) or open to all? (Assume open.)
+- open to all
+Config Additions (proposed): raid: minPlayers: 1 worldSizeChunks: 16 durationMinutes: 10 extraction: channelSeconds: 10 radius: 3 particle: HAPPY_VILLAGER maxConcurrentSessions: 5 cleanup: deleteWorldOnEnd: true spawn: safeScanMaxTries: 50 queue: autoStart: true
+Confirm or adjust.
